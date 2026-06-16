@@ -117,7 +117,8 @@
     // ---------- p5 lifecycle ----------
     function preload() {
       // Load the hand-tracking model up front so it's ready when the user starts.
-      handPose = ml5.handPose({ flipped: true }, () => { modelReady = true; });
+      // Keep coords in raw (unmirrored) video space; we mirror the display ourselves.
+      handPose = ml5.handPose({ flipped: false }, () => { modelReady = true; });
     }
 
     function setup() {
@@ -135,9 +136,9 @@
       const errEl = document.getElementById('start-error');
       errEl.textContent = '';
 
-      // flipped:true mirrors the capture so it reads like a mirror.
+      // We mirror at draw time (see drawMirrored) so it reads like a mirror.
       video = createCapture(
-        { video: true, audio: false, flipped: true },
+        { video: true, audio: false },
         () => {
           // Success: hide the overlay and begin detection.
           started = true;
@@ -158,70 +159,97 @@
 
     function draw() {
       background(0);
-      if (!started || !video || video.width === 0) return;
+      if (!started || !video) return;
+
+      const vw = video.width, vh = video.height;
+      if (!vw || !vh) return; // wait until the capture has real dimensions
 
       // "cover" fit: scale the video to fill the canvas, cropping the overflow.
-      const scale = Math.max(width / video.width, height / video.height);
-      const drawW = video.width * scale;
-      const drawH = video.height * scale;
+      const scale = Math.max(width / vw, height / vh);
+      const drawW = vw * scale;
+      const drawH = vh * scale;
       const offX = (width - drawW) / 2;
       const offY = (height - drawH) / 2;
 
-      const detected = hands.length > 0;
+      try {
+        const tip = hands.length > 0 &&
+          hands[0].keypoints && hands[0].keypoints[INDEX_FINGERTIP];
 
-      if (!detected) {
-        drawNoHand(offX, offY, drawW, drawH);
-        return;
+        if (!tip) {
+          smoothedTip = null;
+          drawNoHand(offX, offY, drawW, drawH);
+          return;
+        }
+
+        // ---- Hand present: drive pixelation from the index fingertip's height ----
+        // ml5 returns coordinates in (unmirrored) video space; convert to canvas space.
+        const tipCanvas = { x: offX + tip.x * scale, y: offY + tip.y * scale };
+
+        // Smooth the tip so the effect doesn't jitter.
+        if (!smoothedTip) smoothedTip = { ...tipCanvas };
+        smoothedTip.x = lerp(smoothedTip.x, tipCanvas.x, SMOOTHING);
+        smoothedTip.y = lerp(smoothedTip.y, tipCanvas.y, SMOOTHING);
+
+        // Map vertical position -> sample resolution.
+        // top (y=0) => MIN_SAMPLE (1 px) ; bottom (y=height) => full resolution.
+        const t = constrain(smoothedTip.y / height, 0, 1);
+        const fullSample = vw / MAX_SAMPLE_DIVISOR;
+        const targetSample = lerp(MIN_SAMPLE, fullSample, t);
+        smoothedSample = lerp(smoothedSample, targetSample, SMOOTHING);
+
+        // Base layer: always draw the live (mirrored) video, so even if the
+        // pixelation step renders nothing, the screen can never go fully black.
+        drawMirrored(() => image(video, offX, offY, drawW, drawH));
+
+        // Pixelation layer on top.
+        drawPixelated(smoothedSample, vw, vh, offX, offY, drawW, drawH);
+
+        // HUD + fingertip marker are drawn unmirrored, so mirror the x ourselves.
+        drawHUD(smoothedSample, vw, vh, width - smoothedTip.x, smoothedTip.y);
+      } catch (err) {
+        showError(err);
       }
-
-      // ---- Hand present: drive pixelation from the index fingertip's height ----
-      const tip = hands[0].keypoints[INDEX_FINGERTIP];
-      // ml5 returns coordinates in video space; convert to canvas space.
-      const tipCanvas = {
-        x: offX + tip.x * scale,
-        y: offY + tip.y * scale
-      };
-
-      // Smooth the tip so the effect doesn't jitter.
-      if (!smoothedTip) smoothedTip = { ...tipCanvas };
-      smoothedTip.x = lerp(smoothedTip.x, tipCanvas.x, SMOOTHING);
-      smoothedTip.y = lerp(smoothedTip.y, tipCanvas.y, SMOOTHING);
-
-      // Map vertical position -> sample resolution.
-      // top (y=0) => MIN_SAMPLE (1 px) ; bottom (y=height) => full resolution.
-      const t = constrain(smoothedTip.y / height, 0, 1);
-      const fullSample = video.width / MAX_SAMPLE_DIVISOR;
-      const targetSample = lerp(MIN_SAMPLE, fullSample, t);
-      smoothedSample = lerp(smoothedSample, targetSample, SMOOTHING);
-
-      drawPixelated(smoothedSample, offX, offY, drawW, drawH);
-      drawHUD(smoothedSample, smoothedTip);
     }
 
     // ---------- Rendering helpers ----------
 
+    // Run a drawing callback flipped horizontally so the feed reads like a mirror.
+    // With our symmetric offsets the same coordinates fill the same on-screen region.
+    function drawMirrored(fn) {
+      push();
+      translate(width, 0);
+      scale(-1, 1);
+      fn();
+      pop();
+    }
+
     // Downscale into a tiny buffer, then upscale with no smoothing => blocky pixels.
-    function drawPixelated(sample, offX, offY, drawW, drawH) {
+    function drawPixelated(sample, vw, vh, offX, offY, drawW, drawH) {
       const s = Math.max(1, Math.round(sample));
-      const aspect = video.height / video.width;
       const bw = s;
-      const bh = Math.max(1, Math.round(s * aspect));
+      const bh = Math.max(1, Math.round(s * (vh / vw)));
 
-      if (pg.width !== bw || pg.height !== bh) pg.resize(bw, bh);
-
+      if (pg.width !== bw || pg.height !== bh) pg.resizeCanvas(bw, bh, true);
+      pg.clear();
       pg.image(video, 0, 0, bw, bh); // shrink the frame down
-      noSmooth();                    // keep the blocks crisp when scaled up
-      image(pg, offX, offY, drawW, drawH);
-      smooth();
+
+      drawMirrored(() => {
+        noSmooth();                  // keep the blocks crisp when scaled up
+        image(pg, offX, offY, drawW, drawH);
+        smooth();
+      });
     }
 
     // Blurry feed + prompt when no hand is in view.
     function drawNoHand(offX, offY, drawW, drawH) {
-      drawingContext.filter = `blur(${BLUR_AMOUNT}px)`;
-      image(video, offX, offY, drawW, drawH);
-      drawingContext.filter = 'none';
+      drawMirrored(() => {
+        drawingContext.filter = `blur(${BLUR_AMOUNT}px)`;
+        image(video, offX, offY, drawW, drawH);
+        drawingContext.filter = 'none';
+      });
 
       // Dim overlay for legible text.
+      noStroke();
       fill(0, 110);
       rect(0, 0, width, height);
 
@@ -240,11 +268,12 @@
     }
 
     // Small readout + a marker on the tracked fingertip.
-    function drawHUD(sample, tip) {
+    function drawHUD(sample, vw, vh, markerX, markerY) {
       const s = Math.max(1, Math.round(sample));
-      const res = `${s}×${Math.max(1, Math.round(s * (video.height / video.width)))}`;
+      const res = `${s}×${Math.max(1, Math.round(s * (vh / vw)))}`;
 
       push();
+      noStroke();
       fill(0, 130);
       rect(16, 16, 188, 56, 10);
       fill(244, 241, 234);
@@ -262,8 +291,22 @@
       noFill();
       stroke(196, 90, 54);
       strokeWeight(3);
-      circle(tip.x, tip.y, 26);
+      circle(markerX, markerY, 26);
       pop();
+    }
+
+    // Surface runtime errors on the canvas instead of silently freezing on black.
+    function showError(err) {
+      push();
+      noStroke();
+      fill(0, 160);
+      rect(0, height - 60, width, 60);
+      fill(255, 120, 90);
+      textSize(13);
+      textAlign(LEFT, CENTER);
+      text('error: ' + (err && err.message ? err.message : err), 16, height - 30);
+      pop();
+      console.error(err);
     }
   </script>
 </body>
