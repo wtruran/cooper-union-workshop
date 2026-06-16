@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>CODEC // green-screen webcam</title>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.4/p5.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.4/addons/p5.sound.min.js"></script>
+
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; overflow: hidden; background: #02060a; }
+    canvas { display: block; }
+
+    #start-screen {
+      position: fixed; inset: 0; z-index: 10;
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      gap: 1.4rem; text-align: center; padding: 2rem;
+      background: radial-gradient(circle at 50% 45%, #06140e, #010402);
+      color: #86ffc2; font-family: "Courier New", monospace;
+    }
+    #start-screen h1 {
+      font-size: clamp(1.4rem, 4vw, 2.4rem); letter-spacing: 0.35em;
+      text-shadow: 0 0 12px rgba(134,255,194,0.8);
+    }
+    #start-screen p { max-width: 32rem; line-height: 1.6; opacity: 0.75; letter-spacing: 0.08em; }
+    #start-btn {
+      margin-top: 0.4rem; padding: 0.85rem 2.4rem; letter-spacing: 0.3em;
+      font-family: inherit; font-size: 1rem; font-weight: bold; cursor: pointer;
+      color: #03110b; background: #5fe6a4; border: 2px solid #86ffc2; border-radius: 4px;
+      box-shadow: 0 0 18px rgba(134,255,194,0.6); transition: transform .12s, box-shadow .12s;
+    }
+    #start-btn:hover { transform: translateY(-2px); box-shadow: 0 0 26px rgba(134,255,194,0.9); }
+    #start-error { color: #ff8a6a; min-height: 1.2em; letter-spacing: 0.05em; }
+    .hint { font-size: 0.78rem; opacity: 0.45; letter-spacing: 0.1em; }
+  </style>
+</head>
+<body>
+  <div id="start-screen">
+    <h1>C O D E C</h1>
+    <p>Live webcam on the left (green CRT, scanlines). Sound-reactive radial fan on the right,
+       driven by your microphone. Segment clock below.</p>
+    <button id="start-btn">START FREQUENCY</button>
+    <div id="start-error"></div>
+    <div class="hint">Needs camera + microphone access — everything stays in your browser.</div>
+  </div>
+
+  <script>
+    // ---------- palette ----------
+    const GR = [130, 255, 190];   // primary green
+    const GR_DIM = [22, 60, 44];  // unlit segment / faint
+    const NUM_BARS = 18;
+
+    // ---------- state ----------
+    let video, pg;            // webcam + pixelation buffer
+    let mic, fft, amp;        // audio
+    let started = false;
+    let smoothLevel = 0;
+
+    // 7-segment lookup: which of segments [a,b,c,d,e,f,g] are lit per digit
+    const SEG = {
+      0:[1,1,1,1,1,1,0], 1:[0,1,1,0,0,0,0], 2:[1,1,0,1,1,0,1], 3:[1,1,1,1,0,0,1],
+      4:[0,1,1,0,0,1,1], 5:[1,0,1,1,0,1,1], 6:[1,0,1,1,1,1,1], 7:[1,1,1,0,0,0,0],
+      8:[1,1,1,1,1,1,1], 9:[1,1,1,1,0,1,1]
+    };
+
+    function setup() {
+      const c = createCanvas(windowWidth, windowHeight);
+      c.position(0, 0);
+      pixelDensity(1);
+      pg = createGraphics(64, 48);
+      pg.pixelDensity(1);
+      pg.noSmooth();
+      noStroke();
+      document.getElementById('start-btn').addEventListener('click', startSystem);
+    }
+
+    function startSystem() {
+      const errEl = document.getElementById('start-error');
+      errEl.textContent = '';
+      try {
+        userStartAudio(); // resume the audio context on the user gesture
+
+        video = createCapture({ video: true, audio: false }, () => {
+          started = true;
+          document.getElementById('start-screen').style.display = 'none';
+        });
+        video.elt.setAttribute('playsinline', '');
+        video.hide();
+
+        mic = new p5.AudioIn();
+        mic.start();
+        fft = new p5.FFT(0.85, 256);
+        fft.setInput(mic);
+        amp = new p5.Amplitude();
+        amp.setInput(mic);
+      } catch (e) {
+        errEl.textContent = 'could not start: ' + (e.message || e);
+      }
+    }
+
+    function windowResized() { resizeCanvas(windowWidth, windowHeight); }
+
+    function draw() {
+      background(2, 7, 5);
+      if (!started) return;
+
+      try {
+        // ---- layout ----
+        const pad = Math.max(18, Math.min(width, height) * 0.04);
+        const gap = pad;
+        const clockH = Math.min(height * 0.2, 160);
+        const rowH = height - pad * 2 - clockH - gap;
+        const panelW = (width - pad * 2 - gap) / 2;
+
+        const lx = pad, ly = pad;
+        const rx = pad + panelW + gap, ry = pad;
+
+        drawVideoPanel(lx, ly, panelW, rowH);
+        drawCodecModule(rx, ry, panelW, rowH);
+        drawClock(ly + rowH + gap, clockH);
+      } catch (e) {
+        showError(e);
+      }
+
+      drawGlobalScanlines();
+    }
+
+    function showError(err) {
+      push();
+      noStroke(); fill(0, 170); rect(0, height - 54, width, 54);
+      fill(255, 120, 90); textFont('Courier New'); textSize(13);
+      textAlign(LEFT, CENTER);
+      text('error: ' + (err && err.message ? err.message : err), 16, height - 27);
+      pop();
+      console.error(err);
+    }
+
+    // ============================================================ LEFT: webcam
+    function drawVideoPanel(x, y, w, h) {
+      const ctx = drawingContext;
+
+      ctx.save();
+      tracePanel(ctx, x, y, w, h, 10);
+      ctx.clip();
+
+      noStroke(); fill(4, 14, 9); rect(x, y, w, h);
+
+      if (video && video.width) {
+        const vw = video.width, vh = video.height;
+        const PIX = 7; // downscale factor => pixelation
+        const bw = Math.max(2, Math.floor(vw / PIX));
+        const bh = Math.max(2, Math.floor(vh / PIX));
+        if (pg.width !== bw || pg.height !== bh) pg.resizeCanvas(bw, bh, true);
+        pg.clear();
+        pg.image(video, 0, 0, bw, bh);
+        pg.filter(GRAY); // monochrome so the green tint reads as a true CRT
+
+        // "cover" fit
+        const s = Math.max(w / vw, h / vh);
+        const dw = vw * s, dh = vh * s;
+        const dx = x + (w - dw) / 2, dy = y + (h - dh) / 2;
+
+        noSmooth();
+        push();
+        translate(dx + dw, dy); // mirror (selfie view)
+        scale(-1, 1);
+        tint(GR[0], GR[1], GR[2]);
+        image(pg, 0, 0, dw, dh);
+        pop();
+        noTint();
+        smooth();
+      }
+
+      // scanlines + faint green wash
+      noStroke();
+      fill(GR[0], GR[1], GR[2], 12); rect(x, y, w, h);
+      stroke(0, 0, 0, 95); strokeWeight(1);
+      for (let yy = y; yy < y + h; yy += 3) line(x, yy, x + w, yy);
+      noStroke();
+
+      ctx.restore();
+      strokePanelBorder(x, y, w, h, 10);
+
+      // little corner label
+      labelTag(x + 14, y + 12, 'CH 01');
+    }
+
+    // ============================================================ RIGHT: codec module
+    function drawCodecModule(x, y, w, h) {
+      const ctx = drawingContext;
+
+      ctx.save();
+      tracePanel(ctx, x, y, w, h, 10);
+      ctx.clip();
+      noStroke(); fill(3, 12, 8); rect(x, y, w, h);
+
+      const barH = Math.max(26, h * 0.1);
+      // top + bottom label bars
+      fill(8, 26, 18); rect(x, y, w, barH); rect(x, y + h - barH, w, barH);
+      drawSpacedLabel(x + w / 2, y + barH / 2, 'PTT', barH * 0.38);
+      drawSpacedLabel(x + w / 2, y + h - barH / 2, 'MEMORY', barH * 0.38);
+
+      // ---- audio analysis ----
+      const spectrum = fft ? fft.analyze() : [];
+      const level = amp ? amp.getLevel() : 0;
+      smoothLevel = lerp(smoothLevel, level, 0.25);
+
+      // ---- stacked horizontal bars (codec signal meter, like the reference) ----
+      // Bars stack top-to-bottom, left-aligned, and grow rightward with sound.
+      // Low frequencies map to the top bars (more energy) so they naturally form
+      // the signature descending curve.
+      const numH = h * 0.18;                          // room reserved for the readout
+      const fx = x + w * 0.08;
+      const fyTop = y + barH + h * 0.05;
+      const fyBot = y + h - barH - numH - h * 0.06;
+      const slotH = (fyBot - fyTop) / NUM_BARS;
+      const barTh = slotH * 0.72;
+      const maxLen = w * 0.84;
+
+      noStroke();
+      for (let i = 0; i < NUM_BARS; i++) {
+        const lo = Math.floor(map(i, 0, NUM_BARS, 0, spectrum.length * 0.7));
+        const hi = Math.floor(map(i + 1, 0, NUM_BARS, 0, spectrum.length * 0.7));
+        let sum = 0, cnt = 0;
+        for (let j = lo; j <= hi && j < spectrum.length; j++) { sum += spectrum[j]; cnt++; }
+        const e = cnt ? (sum / cnt) / 255 : 0;
+        const curve = Math.pow(1 - i / (NUM_BARS - 1), 1.5);   // resting descending shape
+        const frac = constrain(curve * (0.6 + 0.7 * e) + 0.02, 0.02, 1);
+        const yy = fyTop + i * slotH;
+
+        // only the lit bar (no full-width guide) so it forms a curve, not a block
+        fill(GR[0], GR[1], GR[2], 240);
+        rect(fx, yy, maxLen * frac, barTh, barTh * 0.35);
+      }
+
+      // segment readout centered along the bottom (the codec frequency display)
+      const lvl = Math.min(999, Math.floor(smoothLevel * 1400));
+      const txt = String(lvl).padStart(3, '0');
+      const dH = numH * 0.8;
+      const dW = dH * 0.55;
+      const dG = dW * 0.32;
+      const totW = txt.length * dW + (txt.length - 1) * dG;
+      let nx = x + w / 2 - totW / 2;
+      const ny = y + h - barH - dH - h * 0.04;
+      for (const ch of txt) {
+        drawDigit(nx, ny, dW, dH, parseInt(ch, 10));
+        nx += dW + dG;
+      }
+
+      ctx.restore();
+      strokePanelBorder(x, y, w, h, 10);
+    }
+
+    // ============================================================ BOTTOM: segment clock
+    function drawClock(topY, maxH) {
+      const now = new Date();
+      const hh = String(now.getHours()).padStart(2, '0');
+      const mm = String(now.getMinutes()).padStart(2, '0');
+
+      const dh = maxH * 0.72;
+      const dw = dh * 0.55;
+      const dg = dw * 0.28;       // gap between digits
+      const colonW = dw * 0.55;
+      const totalW = 4 * dw + 3 * dg + colonW + dg * 2;
+      let x = width / 2 - totalW / 2;
+      const y = topY + (maxH - dh) / 2;
+
+      // backing plate
+      const padP = dw * 0.5;
+      const plateX = x - padP, plateY = y - padP * 0.5;
+      const plateW = totalW + padP * 2, plateH = dh + padP;
+      const ctx = drawingContext;
+      ctx.save();
+      tracePanel(ctx, plateX, plateY, plateW, plateH, 8);
+      noStroke(); fill(3, 12, 8); rect(plateX, plateY, plateW, plateH);
+      ctx.restore();
+
+      drawDigit(x, y, dw, dh, parseInt(hh[0], 10)); x += dw + dg;
+      drawDigit(x, y, dw, dh, parseInt(hh[1], 10)); x += dw + dg;
+      drawColon(x, y, colonW, dh);                  x += colonW + dg;
+      drawDigit(x, y, dw, dh, parseInt(mm[0], 10)); x += dw + dg;
+      drawDigit(x, y, dw, dh, parseInt(mm[1], 10));
+
+      strokePanelBorder(plateX, plateY, plateW, plateH, 8);
+      drawSpacedLabel(width / 2, plateY + plateH + maxH * 0.07, 'SYSTEM TIME', maxH * 0.09);
+    }
+
+    // ---------- 7-segment helpers ----------
+    function drawDigit(x, y, w, h, d) {
+      const segs = SEG[d] || SEG[8];
+      const t = Math.min(w, h) * 0.16;          // segment thickness
+      const vlen = (h - 3 * t) / 2;             // vertical segment length
+      const hlen = w - 2 * t;                   // horizontal segment length
+      const on = (i) => segs[i] === 1;
+
+      // a (top), b (tr), c (br), d (bottom), e (bl), f (tl), g (mid)
+      seg(x + t, y, hlen, t, on(0), true);                          // a
+      seg(x + w - t, y + t, t, vlen, on(1), false);                 // b
+      seg(x + w - t, y + 2 * t + vlen, t, vlen, on(2), false);      // c
+      seg(x + t, y + h - t, hlen, t, on(3), true);                  // d
+      seg(x, y + 2 * t + vlen, t, vlen, on(4), false);              // e
+      seg(x, y + t, t, vlen, on(5), false);                         // f
+      seg(x + t, y + (h - t) / 2, hlen, t, on(6), true);            // g
+    }
+
+    function seg(x, y, w, h, lit, horizontal) {
+      const ctx = drawingContext;
+      const r = Math.min(w, h) * 0.45;
+      noStroke();
+      if (lit) {
+        ctx.save();
+        ctx.shadowBlur = Math.min(w, h) * 0.18;
+        ctx.shadowColor = 'rgba(130,255,190,0.6)';
+        fill(GR[0], GR[1], GR[2]);
+        rect(x, y, w, h, r);
+        ctx.restore();
+      } else {
+        fill(GR[0], GR[1], GR[2], 11); // ghost of an unlit segment, barely visible
+        rect(x, y, w, h, r);
+      }
+    }
+
+    function drawColon(x, y, w, h) {
+      const r = w * 0.32;
+      const cx = x + w / 2;
+      const ctx = drawingContext;
+      // blink on even seconds
+      const lit = new Date().getSeconds() % 2 === 0;
+      ctx.save();
+      if (lit) { ctx.shadowBlur = r * 0.5; ctx.shadowColor = 'rgba(130,255,190,0.6)'; fill(GR[0], GR[1], GR[2]); }
+      else fill(GR[0], GR[1], GR[2], 11);
+      circle(cx, y + h * 0.34, r);
+      circle(cx, y + h * 0.66, r);
+      ctx.restore();
+    }
+
+    // ---------- chrome helpers ----------
+    function tracePanel(ctx, x, y, w, h, r) {
+      ctx.beginPath();
+      ctx.moveTo(x + r, y);
+      ctx.arcTo(x + w, y, x + w, y + h, r);
+      ctx.arcTo(x + w, y + h, x, y + h, r);
+      ctx.arcTo(x, y + h, x, y, r);
+      ctx.arcTo(x, y, x + w, y, r);
+      ctx.closePath();
+    }
+
+    function strokePanelBorder(x, y, w, h, r) {
+      if (w <= 0 || h <= 0) return;
+      const ctx = drawingContext;
+      ctx.save();
+      ctx.shadowBlur = 18;
+      ctx.shadowColor = 'rgba(130,255,190,0.6)';
+      noFill(); stroke(150, 255, 200); strokeWeight(2.5);
+      rect(x, y, w, h, r);
+      ctx.restore();
+      noStroke();
+    }
+
+    function drawSpacedLabel(cx, cy, str, size) {
+      push();
+      textFont('Courier New');
+      textStyle(BOLD);
+      textAlign(CENTER, CENTER);
+      textSize(size);
+      const spaced = str.split('').join('  ');
+      drawingContext.shadowBlur = size * 0.6;
+      drawingContext.shadowColor = 'rgba(130,255,190,0.7)';
+      fill(GR[0], GR[1], GR[2]);
+      text(spaced, cx, cy);
+      pop();
+    }
+
+    function labelTag(x, y, str) {
+      push();
+      textFont('Courier New'); textStyle(BOLD); textAlign(LEFT, TOP);
+      textSize(13);
+      fill(GR[0], GR[1], GR[2], 200);
+      text(str, x, y);
+      pop();
+    }
+
+    function drawGlobalScanlines() {
+      noStroke();
+      fill(0, 0, 0, 38);
+      for (let y = 0; y < height; y += 4) rect(0, y, width, 2);
+    }
+  </script>
+</body>
+</html>
