@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Hand-Controlled Pixelation</title>
+
+  <!-- p5.js + ml5.js handPose, loaded from CDN (no build step) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.4/p5.min.js"></script>
+  <script src="https://unpkg.com/ml5@1/dist/ml5.min.js"></script>
+
+  <style>
+    :root {
+      --stone: #1a1714;
+      --chalk: #f4f1ea;
+      --rust: #c45a36;
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    html, body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: var(--stone);
+      color: var(--chalk);
+      font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    }
+
+    /* p5 canvas fills the viewport */
+    canvas { display: block; }
+
+    /* Start overlay sits on top until the camera is running */
+    #start-screen {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 1.5rem;
+      text-align: center;
+      padding: 2rem;
+      background: radial-gradient(circle at 50% 40%, #2a2520, #0e0c0a);
+      z-index: 10;
+    }
+
+    #start-screen h1 {
+      font-size: clamp(1.6rem, 4vw, 2.8rem);
+      font-weight: 700;
+      letter-spacing: -0.02em;
+    }
+
+    #start-screen p {
+      max-width: 30rem;
+      line-height: 1.5;
+      opacity: 0.8;
+      font-size: clamp(0.95rem, 2vw, 1.1rem);
+    }
+
+    #start-btn {
+      margin-top: 0.5rem;
+      padding: 0.9rem 2.4rem;
+      font-size: 1.1rem;
+      font-weight: 600;
+      color: var(--chalk);
+      background: var(--rust);
+      border: none;
+      border-radius: 999px;
+      cursor: pointer;
+      transition: transform 0.12s ease, filter 0.12s ease;
+    }
+    #start-btn:hover { transform: translateY(-2px); filter: brightness(1.1); }
+    #start-btn:active { transform: translateY(0); }
+
+    #start-error {
+      color: var(--rust);
+      font-weight: 600;
+      min-height: 1.2em;
+    }
+
+    .hint { font-size: 0.85rem; opacity: 0.55; }
+  </style>
+</head>
+<body>
+  <div id="start-screen">
+    <h1>Hand-Controlled Pixelation</h1>
+    <p>
+      Move your hand up and down in front of the camera.
+      Near the <strong>top</strong> the video collapses into a single giant pixel;
+      near the <strong>bottom</strong> it returns to full resolution.
+    </p>
+    <button id="start-btn">Start Camera</button>
+    <div id="start-error"></div>
+    <div class="hint">Your video never leaves this page — everything runs in your browser.</div>
+  </div>
+
+  <script>
+    // ---------- Config ----------
+    const MIN_SAMPLE = 1;          // top of screen: whole frame = 1 pixel
+    const MAX_SAMPLE_DIVISOR = 1;  // bottom: full resolution (sample = video width)
+    const SMOOTHING = 0.18;        // lerp factor for fingertip + resolution (0..1)
+    const BLUR_AMOUNT = 24;        // px blur used when no hand is detected
+    const INDEX_FINGERTIP = 8;     // ml5 handPose keypoint index for index finger tip
+
+    // ---------- State ----------
+    let video;                 // p5 webcam capture (hidden)
+    let handPose;              // ml5 handPose model
+    let hands = [];            // latest detections
+    let pg;                    // offscreen buffer used for the pixelation downscale
+    let started = false;
+    let modelReady = false;
+
+    let smoothedTip = null;    // {x, y} in canvas space, smoothed
+    let smoothedSample = 1;    // smoothed sample resolution
+
+    // ---------- p5 lifecycle ----------
+    function preload() {
+      // Load the hand-tracking model up front so it's ready when the user starts.
+      // Keep coords in raw (unmirrored) video space; we mirror the display ourselves.
+      handPose = ml5.handPose({ flipped: false }, () => { modelReady = true; });
+    }
+
+    function setup() {
+      const c = createCanvas(windowWidth, windowHeight);
+      c.position(0, 0);
+      pixelDensity(1);
+      pg = createGraphics(160, 120); // small buffer; resized once we know the video size
+      pg.pixelDensity(1);
+      noStroke();
+
+      document.getElementById('start-btn').addEventListener('click', startCamera);
+    }
+
+    function startCamera() {
+      const errEl = document.getElementById('start-error');
+      errEl.textContent = '';
+
+      // We mirror at draw time (see drawMirrored) so it reads like a mirror.
+      video = createCapture(
+        { video: true, audio: false },
+        () => {
+          // Success: hide the overlay and begin detection.
+          started = true;
+          document.getElementById('start-screen').style.display = 'none';
+          handPose.detectStart(video, (results) => { hands = results; });
+        }
+      );
+      video.elt.setAttribute('playsinline', ''); // iOS Safari inline playback
+      video.hide();
+
+      // If the model is still downloading, let the user know.
+      if (!modelReady) errEl.textContent = 'Loading hand-tracking model…';
+    }
+
+    function windowResized() {
+      resizeCanvas(windowWidth, windowHeight);
+    }
+
+    function draw() {
+      background(0);
+      if (!started || !video) return;
+
+      const vw = video.width, vh = video.height;
+      if (!vw || !vh) return; // wait until the capture has real dimensions
+
+      // "cover" fit: scale the video to fill the canvas, cropping the overflow.
+      const scale = Math.max(width / vw, height / vh);
+      const drawW = vw * scale;
+      const drawH = vh * scale;
+      const offX = (width - drawW) / 2;
+      const offY = (height - drawH) / 2;
+
+      try {
+        const tip = hands.length > 0 &&
+          hands[0].keypoints && hands[0].keypoints[INDEX_FINGERTIP];
+
+        if (!tip) {
+          smoothedTip = null;
+          drawNoHand(offX, offY, drawW, drawH);
+          return;
+        }
+
+        // ---- Hand present: drive pixelation from the index fingertip's height ----
+        // ml5 returns coordinates in (unmirrored) video space; convert to canvas space.
+        const tipCanvas = { x: offX + tip.x * scale, y: offY + tip.y * scale };
+
+        // Smooth the tip so the effect doesn't jitter.
+        if (!smoothedTip) smoothedTip = { ...tipCanvas };
+        smoothedTip.x = lerp(smoothedTip.x, tipCanvas.x, SMOOTHING);
+        smoothedTip.y = lerp(smoothedTip.y, tipCanvas.y, SMOOTHING);
+
+        // Map vertical position -> sample resolution.
+        // top (y=0) => MIN_SAMPLE (1 px) ; bottom (y=height) => full resolution.
+        const t = constrain(smoothedTip.y / height, 0, 1);
+        const fullSample = vw / MAX_SAMPLE_DIVISOR;
+        const targetSample = lerp(MIN_SAMPLE, fullSample, t);
+        smoothedSample = lerp(smoothedSample, targetSample, SMOOTHING);
+
+        // Base layer: always draw the live (mirrored) video, so even if the
+        // pixelation step renders nothing, the screen can never go fully black.
+        drawMirrored(() => image(video, offX, offY, drawW, drawH));
+
+        // Pixelation layer on top.
+        drawPixelated(smoothedSample, vw, vh, offX, offY, drawW, drawH);
+
+        // HUD + fingertip marker are drawn unmirrored, so mirror the x ourselves.
+        drawHUD(smoothedSample, vw, vh, width - smoothedTip.x, smoothedTip.y);
+      } catch (err) {
+        showError(err);
+      }
+    }
+
+    // ---------- Rendering helpers ----------
+
+    // Run a drawing callback flipped horizontally so the feed reads like a mirror.
+    // With our symmetric offsets the same coordinates fill the same on-screen region.
+    function drawMirrored(fn) {
+      push();
+      translate(width, 0);
+      scale(-1, 1);
+      fn();
+      pop();
+    }
+
+    // Downscale into a tiny buffer, then upscale with no smoothing => blocky pixels.
+    function drawPixelated(sample, vw, vh, offX, offY, drawW, drawH) {
+      const s = Math.max(1, Math.round(sample));
+      const bw = s;
+      const bh = Math.max(1, Math.round(s * (vh / vw)));
+
+      if (pg.width !== bw || pg.height !== bh) pg.resizeCanvas(bw, bh, true);
+      pg.clear();
+      pg.image(video, 0, 0, bw, bh); // shrink the frame down
+
+      drawMirrored(() => {
+        noSmooth();                  // keep the blocks crisp when scaled up
+        image(pg, offX, offY, drawW, drawH);
+        smooth();
+      });
+    }
+
+    // Blurry feed + prompt when no hand is in view.
+    function drawNoHand(offX, offY, drawW, drawH) {
+      drawMirrored(() => {
+        drawingContext.filter = `blur(${BLUR_AMOUNT}px)`;
+        image(video, offX, offY, drawW, drawH);
+        drawingContext.filter = 'none';
+      });
+
+      // Dim overlay for legible text.
+      noStroke();
+      fill(0, 110);
+      rect(0, 0, width, height);
+
+      push();
+      textAlign(CENTER, CENTER);
+      fill(244, 241, 234);
+      textSize(min(width, height) * 0.045);
+      textStyle(BOLD);
+      text('✋  Show your hand to the camera', width / 2, height / 2 - 10);
+      textSize(min(width, height) * 0.022);
+      textStyle(NORMAL);
+      fill(244, 241, 234, 180);
+      text('Move it up to pixelate · down for full resolution',
+           width / 2, height / 2 + min(width, height) * 0.045);
+      pop();
+    }
+
+    // Small readout + a marker on the tracked fingertip.
+    function drawHUD(sample, vw, vh, markerX, markerY) {
+      const s = Math.max(1, Math.round(sample));
+      const res = `${s}×${Math.max(1, Math.round(s * (vh / vw)))}`;
+
+      push();
+      noStroke();
+      fill(0, 130);
+      rect(16, 16, 188, 56, 10);
+      fill(244, 241, 234);
+      textSize(14);
+      textAlign(LEFT, CENTER);
+      textStyle(BOLD);
+      text(`resolution: ${res} px`, 30, 36);
+      textStyle(NORMAL);
+      fill(196, 90, 54);
+      text(s <= 1 ? 'one giant pixel' : 'tracking index finger', 30, 56);
+      pop();
+
+      // Fingertip marker.
+      push();
+      noFill();
+      stroke(196, 90, 54);
+      strokeWeight(3);
+      circle(markerX, markerY, 26);
+      pop();
+    }
+
+    // Surface runtime errors on the canvas instead of silently freezing on black.
+    function showError(err) {
+      push();
+      noStroke();
+      fill(0, 160);
+      rect(0, height - 60, width, 60);
+      fill(255, 120, 90);
+      textSize(13);
+      textAlign(LEFT, CENTER);
+      text('error: ' + (err && err.message ? err.message : err), 16, height - 30);
+      pop();
+      console.error(err);
+    }
+  </script>
+</body>
+</html>
