@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>FALLING APART</title>
+  <style>
+    html, body { margin: 0; padding: 0; overflow: hidden; background: #fff; }
+    canvas { display: block; }
+  </style>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.4/p5.min.js"></script>
+</head>
+<body>
+<script>
+// "FALLING APART" — hover a letter and it shatters into shards that fall to the floor.
+// Each letter is laid out and fragmented independently, so they come apart one at a time.
+
+const LINE = "FALLING APART";
+const FONT_URL = "https://raw.githubusercontent.com/google/fonts/main/ofl/anton/Anton-Regular.ttf";
+
+let font = null;     // loaded p5.Font (null => fall back to default font)
+let letters = [];    // one entry per non-space character
+
+// physics
+const G = 0.45;       // gravity per frame
+const BOUNCE = 0.42;  // floor restitution
+const FRICTION = 0.8; // horizontal damping on contact
+
+function preload() {
+  // Try to load the real font; if it fails we silently use p5's default font.
+  font = loadFont(FONT_URL, () => {}, () => { font = null; });
+}
+
+function setup() {
+  createCanvas(windowWidth, windowHeight);
+  buildLetters();
+}
+
+function draw() {
+  background(255);
+  noStroke();
+  fill(0);
+
+  for (const L of letters) {
+    if (L.state === "intact") {
+      // Trigger on hover, sampled against the letter's actual glyph shape.
+      if (inkAt(L.pg, mouseX - L.bx, mouseY - L.by)) {
+        shatterLetter(L);
+      } else {
+        image(L.pg, L.bx, L.by);
+      }
+    }
+    if (L.state === "falling") {
+      for (const s of L.shards) {
+        updateShard(s);
+        push();
+        translate(s.x, s.y);
+        rotate(s.angle);
+        beginShape();
+        for (const v of s.rel) vertex(v.x, v.y);
+        endShape(CLOSE);
+        pop();
+      }
+    }
+  }
+
+  drawHint();
+}
+
+function drawHint() {
+  push();
+  noStroke();
+  fill(0, 90);
+  textAlign(CENTER, BASELINE);
+  textStyle(NORMAL);
+  textSize(14);
+  if (font) textFont("sans-serif"); // keep the hint in a plain font
+  text("hover the letters", width / 2, height - 28);
+  pop();
+}
+
+// Lay out the headline and render each letter into its own offscreen buffer.
+function buildLetters() {
+  letters = [];
+
+  // Auto-size so the line fills ~86% of the width (and isn't too tall).
+  push();
+  if (font) textFont(font);
+  let s = 300;
+  textSize(s);
+  const total0 = textWidth(LINE) || 1;
+  s = s * ((width * 0.86) / total0);
+  s = min(s, height * 0.5);
+  textSize(s);
+
+  const totalW = textWidth(LINE);
+  let curX = (width - totalW) / 2;
+  const pad = s * 0.35;          // capture glyph overhang + shard jitter
+  const bh = Math.ceil(s * 1.4 + pad * 2);
+  const by = Math.round(height / 2 - bh / 2);
+
+  for (const ch of LINE) {
+    const w = textWidth(ch);
+    if (ch !== " ") {
+      const bw = Math.ceil(w + pad * 2);
+      const lpg = createGraphics(bw, bh);
+      lpg.pixelDensity(1);
+      lpg.background(255);
+      lpg.fill(0);
+      lpg.noStroke();
+      if (font) lpg.textFont(font);
+      lpg.textAlign(LEFT, CENTER);
+      lpg.textSize(s);
+      lpg.text(ch, pad, bh / 2);
+      lpg.loadPixels();
+
+      letters.push({
+        char: ch,
+        pg: lpg,
+        bx: Math.round(curX - pad),
+        by: by,
+        bw, bh,
+        state: "intact",
+        shards: [],
+      });
+    }
+    curX += w;
+  }
+  pop();
+}
+
+// Is the pixel at local (lx,ly) inside this buffer part of a black glyph?
+function inkAt(lpg, lx, ly) {
+  const x = Math.floor(lx), y = Math.floor(ly);
+  if (x < 0 || y < 0 || x >= lpg.width || y >= lpg.height) return false;
+  const i = (x + y * lpg.width) * 4;
+  return lpg.pixels[i] < 128; // red channel: 0 = ink, 255 = bg
+}
+
+// Fragment one letter into jittered triangular shards covering its ink.
+function shatterLetter(L) {
+  const lpg = L.pg;
+  const cell = 12;
+  const cols = Math.ceil(lpg.width / cell);
+  const rows = Math.ceil(lpg.height / cell);
+  const j = cell * 0.4;
+
+  // Shared jittered grid nodes so neighbouring shards share edges.
+  const nodes = [];
+  for (let i = 0; i <= cols; i++) {
+    nodes[i] = [];
+    for (let k = 0; k <= rows; k++) {
+      nodes[i][k] = { x: i * cell + random(-j, j), y: k * cell + random(-j, j) };
+    }
+  }
+
+  const cxLocal = lpg.width / 2;
+
+  for (let i = 0; i < cols; i++) {
+    for (let k = 0; k < rows; k++) {
+      const A = nodes[i][k];
+      const B = nodes[i + 1][k];
+      const C = nodes[i + 1][k + 1];
+      const D = nodes[i][k + 1];
+      addTriangle(L, lpg, A, B, C, cxLocal);
+      addTriangle(L, lpg, A, C, D, cxLocal);
+    }
+  }
+
+  L.state = "falling";
+}
+
+function addTriangle(L, lpg, p1, p2, p3, cxLocal) {
+  const c = {
+    x: (p1.x + p2.x + p3.x) / 3,
+    y: (p1.y + p2.y + p3.y) / 3,
+  };
+  if (!inkAt(lpg, c.x, c.y)) return;
+
+  const rel = [p1, p2, p3].map(v => ({ x: v.x - c.x, y: v.y - c.y }));
+  let radius = 0;
+  for (const r of rel) radius = Math.max(radius, Math.hypot(r.x, r.y));
+
+  const dx = c.x - cxLocal; // outward burst within the letter
+  L.shards.push({
+    x: L.bx + c.x,
+    y: L.by + c.y,
+    rel,
+    radius,
+    vx: dx * 0.02 + random(-1.2, 1.2),
+    vy: random(-5, -1),
+    angle: 0,
+    va: random(-0.15, 0.15),
+  });
+}
+
+function updateShard(s) {
+  s.vy += G;
+  s.x += s.vx;
+  s.y += s.vy;
+  s.angle += s.va;
+
+  const floorY = height - s.radius;
+  if (s.y >= floorY) {
+    s.y = floorY;
+    if (Math.abs(s.vy) > 1.2) {
+      s.vy *= -BOUNCE;
+      s.vx *= FRICTION;
+      s.va *= 0.6;
+    } else {
+      s.vy = 0;
+      s.vx *= FRICTION;
+      s.va *= 0.5;
+      if (Math.abs(s.vx) < 0.05) s.vx = 0;
+      if (Math.abs(s.va) < 0.005) s.va = 0;
+    }
+  }
+
+  if (s.x < s.radius) { s.x = s.radius; s.vx *= -0.5; }
+  if (s.x > width - s.radius) { s.x = width - s.radius; s.vx *= -0.5; }
+}
+
+function mousePressed() {
+  // Click anywhere to reassemble the whole headline.
+  buildLetters();
+}
+
+function windowResized() {
+  resizeCanvas(windowWidth, windowHeight);
+  buildLetters();
+}
+</script>
+</body>
+</html>
