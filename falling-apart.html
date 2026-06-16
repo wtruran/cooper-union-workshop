@@ -105,7 +105,7 @@ function buildLetters() {
       const bw = Math.ceil(w + pad * 2);
       const lpg = createGraphics(bw, bh);
       lpg.pixelDensity(1);
-      lpg.background(255);
+      lpg.clear();            // transparent bg so neighbouring buffers don't cover each other
       lpg.fill(0);
       lpg.noStroke();
       if (font) lpg.textFont(font);
@@ -134,7 +134,7 @@ function inkAt(lpg, lx, ly) {
   const x = Math.floor(lx), y = Math.floor(ly);
   if (x < 0 || y < 0 || x >= lpg.width || y >= lpg.height) return false;
   const i = (x + y * lpg.width) * 4;
-  return lpg.pixels[i] < 128; // red channel: 0 = ink, 255 = bg
+  return lpg.pixels[i + 3] > 128; // alpha channel: opaque = ink, transparent = bg
 }
 
 // Fragment one letter into jittered triangular shards covering its ink.
