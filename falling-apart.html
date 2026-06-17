@@ -7,10 +7,20 @@
   <style>
     html, body { margin: 0; padding: 0; overflow: hidden; background: #fff; }
     canvas { display: block; }
+    #ui {
+      position: fixed; top: 14px; left: 14px; z-index: 10;
+      font: 13px/1.4 sans-serif; color: #555;
+      background: rgba(255,255,255,0.75); padding: 8px 12px; border-radius: 8px;
+      user-select: none;
+    }
+    #ui input { vertical-align: middle; width: 160px; }
   </style>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.4/p5.min.js"></script>
 </head>
 <body>
+<div id="ui">
+  <label>explosion <input id="boom" type="range" min="0.3" max="5" step="0.1" value="1.4"></label>
+</div>
 <script>
 // "FALLING APART" — hover a letter and it shatters into shards that fall to the floor.
 // Each letter is laid out and fragmented independently, so they come apart one at a time.
@@ -114,12 +124,14 @@ function buildLetters() {
       lpg.text(ch, pad, bh / 2);
       lpg.loadPixels();
 
+      const bx = Math.round(curX - pad);
       letters.push({
         char: ch,
         pg: lpg,
-        bx: Math.round(curX - pad),
-        by: by,
+        bx,
+        by,
         bw, bh,
+        box: inkBounds(lpg, bx, by), // tight obstacle box in canvas space
         state: "intact",
         shards: [],
       });
@@ -127,6 +139,24 @@ function buildLetters() {
     curX += w;
   }
   pop();
+}
+
+// Tight bounding box (in canvas coords) of the ink in a letter buffer.
+function inkBounds(lpg, bx, by) {
+  let minX = lpg.width, minY = lpg.height, maxX = -1, maxY = -1;
+  const px = lpg.pixels;
+  for (let y = 0; y < lpg.height; y++) {
+    for (let x = 0; x < lpg.width; x++) {
+      if (px[(x + y * lpg.width) * 4 + 3] > 128) {
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
+    }
+  }
+  if (maxX < 0) return null;
+  return { x: bx + minX, y: by + minY, w: maxX - minX + 1, h: maxY - minY + 1 };
 }
 
 // Is the pixel at local (lx,ly) inside this buffer part of a black glyph?
@@ -155,6 +185,9 @@ function shatterLetter(L) {
   }
 
   const cxLocal = lpg.width / 2;
+  const cyLocal = lpg.height / 2;
+  const slider = document.getElementById("boom");
+  const power = slider ? parseFloat(slider.value) : 1;
 
   for (let i = 0; i < cols; i++) {
     for (let k = 0; k < rows; k++) {
@@ -162,15 +195,15 @@ function shatterLetter(L) {
       const B = nodes[i + 1][k];
       const C = nodes[i + 1][k + 1];
       const D = nodes[i][k + 1];
-      addTriangle(L, lpg, A, B, C, cxLocal);
-      addTriangle(L, lpg, A, C, D, cxLocal);
+      addTriangle(L, lpg, A, B, C, cxLocal, cyLocal, power);
+      addTriangle(L, lpg, A, C, D, cxLocal, cyLocal, power);
     }
   }
 
   L.state = "falling";
 }
 
-function addTriangle(L, lpg, p1, p2, p3, cxLocal) {
+function addTriangle(L, lpg, p1, p2, p3, cxLocal, cyLocal, power) {
   const c = {
     x: (p1.x + p2.x + p3.x) / 3,
     y: (p1.y + p2.y + p3.y) / 3,
@@ -181,16 +214,18 @@ function addTriangle(L, lpg, p1, p2, p3, cxLocal) {
   let radius = 0;
   for (const r of rel) radius = Math.max(radius, Math.hypot(r.x, r.y));
 
-  const dx = c.x - cxLocal; // outward burst within the letter
+  // Outward burst from the letter's center, scaled by the explosion slider.
+  const dx = c.x - cxLocal;
+  const dy = c.y - cyLocal;
   L.shards.push({
     x: L.bx + c.x,
     y: L.by + c.y,
     rel,
     radius,
-    vx: dx * 0.02 + random(-1.2, 1.2),
-    vy: random(-5, -1),
+    vx: (dx * 0.06 + random(-1.2, 1.2)) * power,
+    vy: (dy * 0.06 + random(-5, -1)) * power,
     angle: 0,
-    va: random(-0.15, 0.15),
+    va: random(-0.15, 0.15) * power,
   });
 }
 
@@ -199,6 +234,8 @@ function updateShard(s) {
   s.x += s.vx;
   s.y += s.vy;
   s.angle += s.va;
+
+  collideLetters(s);
 
   const floorY = height - s.radius;
   if (s.y >= floorY) {
@@ -218,6 +255,45 @@ function updateShard(s) {
 
   if (s.x < s.radius) { s.x = s.radius; s.vx *= -0.5; }
   if (s.x > width - s.radius) { s.x = width - s.radius; s.vx *= -0.5; }
+}
+
+// Bounce a shard (treated as a circle) off any still-intact letter's box.
+function collideLetters(s) {
+  for (const L of letters) {
+    if (L.state !== "intact" || !L.box) continue;
+    const b = L.box;
+    const closestX = Math.max(b.x, Math.min(s.x, b.x + b.w));
+    const closestY = Math.max(b.y, Math.min(s.y, b.y + b.h));
+    let nx = s.x - closestX, ny = s.y - closestY;
+    let d2 = nx * nx + ny * ny;
+    if (d2 > s.radius * s.radius) continue;
+
+    if (d2 > 0.0001) {
+      const d = Math.sqrt(d2);
+      nx /= d; ny /= d;
+      const overlap = s.radius - d;
+      s.x += nx * overlap;
+      s.y += ny * overlap;
+    } else {
+      // Center is inside the box — push out through the nearest edge.
+      const left = s.x - b.x, right = b.x + b.w - s.x;
+      const top = s.y - b.y, bottom = b.y + b.h - s.y;
+      const m = Math.min(left, right, top, bottom);
+      if (m === left)        { nx = -1; ny = 0; s.x = b.x - s.radius; }
+      else if (m === right)  { nx = 1;  ny = 0; s.x = b.x + b.w + s.radius; }
+      else if (m === top)    { nx = 0;  ny = -1; s.y = b.y - s.radius; }
+      else                   { nx = 0;  ny = 1;  s.y = b.y + b.h + s.radius; }
+    }
+
+    const vn = s.vx * nx + s.vy * ny;
+    if (vn < 0) {
+      const e = 0.5; // restitution
+      s.vx -= (1 + e) * vn * nx;
+      s.vy -= (1 + e) * vn * ny;
+      s.vx *= 0.92;  // a little tangential drag
+      s.va *= 0.9;
+    }
+  }
 }
 
 function mousePressed() {
